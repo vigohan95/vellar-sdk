@@ -669,3 +669,65 @@ that have no common unit — the cheaper-looking option wins by accident of magn
 Replace the `reduce` in `selectRequirements` (src/x402-guards.ts:142-144) with
 `selectWithAssetPreference` when candidates span multiple assets, or add an optional
 `preferredAssets` field to `X402PayOptions`.
+---
+
+## 20. Wallet Secrets Never Appear in a Thrown WalletApiError (#674)
+
+We add [contrib/wallet-api-error-no-secrets/wallet-api-error-no-secrets.test.ts](wallet-api-error-no-secrets/wallet-api-error-no-secrets.test.ts)
+with the detector and the boundary redactor in
+[contrib/wallet-api-error-no-secrets/redact-request-echo.ts](wallet-api-error-no-secrets/redact-request-echo.ts).
+
+### The Contract
+A `WalletApiError` — its `message`, `code`, `stack`, `String(err)` and `JSON.stringify(err)` —
+never contains any fragment of a secret-bearing request field: the signed envelope (`signedXdr`,
+`signedTx`), the passkey credential id (`keyId`), or any session token. Errors are logged, shipped
+to crash reporters and shown in UIs; a signed envelope in a log line is a replayable payment.
+
+### What the Tests Prove
+- **Holds today for SDK-built errors**: 4 request shapes (all three endpoints, `signedTx` both as a
+  `toXDR()` object and as a string) × 8 error-body shapes (JSON with message/error/neither, JSON
+  `null`, JSON array, HTML, empty, 429), each with a real signed envelope built with
+  `@stellar/stellar-sdk` on the wire — no fragment (12-char window, in base64, hex or base64url
+  form) reaches message, `String()`, stack, JSON or own properties. `JSON.stringify(err)` is
+  exactly `{ status, code, name }`.
+- **The gap (characterization)**: a gateway that echoes the request into `message` or `error` is
+  repeated verbatim — the fragment reaches `message`/`String()`/`stack`, or `code` and therefore
+  the JSON form. These tests assert current behaviour and are to be deleted when core redacts.
+- **The fix**: `createRedactingHttpWalletBackend` sends byte-identical requests (parity test) and
+  rewrites only a thrown `WalletApiError`'s `message`/`code`, replacing any run of ≥ 12 chars of a
+  secret (longest run, all forms, partial echoes, both fields) with `[redacted:<field>]`.
+  `instanceof WalletApiError`, `name`, `status` and `code` semantics are preserved;
+  `redactedFields` says which fields were echoed. Non-echoing errors, success responses, 404 →
+  `undefined` on `/wallet/connect` and transport failures pass through untouched.
+- **payments-client**: validation errors are thrown before `kit.sign` is called (nothing to leak);
+  `confirm()` against an echoing gateway leaks through the plain backend and is contained by the
+  redacting one.
+- **policy-client**: pins that every policy request field (`definition`, `network`, `wallet`,
+  `policyId`, `txHash`, `contractId`) is public chain data, and that `PolicyApiError` never carries
+  the request body (JSON form is `{ name, status, errors, retryable }`).
+- **Guards the guard**: the detector catches a planted 12-char fragment and ignores 11.
+
+### Manual Run
+```sh
+npx vitest run contrib/wallet-api-error-no-secrets
+```
+
+### Integration into Core
+1. **`src/http-backend.ts`**, above `class WalletApiError` — the contract, verbatim:
+   ```ts
+   /**
+    * Thrown for non-2xx gateway responses.
+    *
+    * NO SECRETS IN ERRORS: `message`, `code`, `stack`, `String(err)` and
+    * `JSON.stringify(err)` must never contain any fragment of a secret-bearing
+    * request field — the signed envelope (`signedXdr` / `signedTx`), the passkey
+    * credential id (`keyId`) or a session token. The message is built from the
+    * RESPONSE only; a gateway echo of the request is redacted before this error
+    * is thrown. Tested in http-backend.test.ts ("no fragment of the request").
+    */
+   ```
+2. **`src/http-backend.ts`**, `toApiError`: give it the request's secret-bearing values and run
+   `redactSecrets` over `payload.message` / `payload.error` before constructing the error
+   (`createRedactingHttpWalletBackend` then collapses into `createHttpWalletBackend`).
+3. **`src/http-backend.test.ts`** (new, as the issue asks): move the "carries no fragment" matrix
+   there; the characterization tests flip and are deleted.
