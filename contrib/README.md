@@ -669,3 +669,59 @@ that have no common unit — the cheaper-looking option wins by accident of magn
 Replace the `reduce` in `selectRequirements` (src/x402-guards.ts:142-144) with
 `selectWithAssetPreference` when candidates span multiple assets, or add an optional
 `preferredAssets` field to `X402PayOptions`.
+---
+
+## 21. Nonce Reused Across Two Different Resources (#666)
+
+We add [contrib/x402-nonce-scope/nonce-scope.test.ts](x402-nonce-scope/nonce-scope.test.ts)
+with the scoped store and its rationale in [contrib/x402-nonce-scope/nonce-scope.ts](x402-nonce-scope/nonce-scope.ts).
+
+### Premise Check
+`src/x402-guards.ts` is the pure 402-decode / option-selection layer and holds no nonce or session
+state (pinned by a test over its exports). The nonce in question is the `X-Vellar-Nonce` of the
+SDK → facilitator request signature (`src/x402-request-auth.ts`), whose verifier contract (#407,
+`contrib/x402-wave-407-411/request-auth-vectors.ts`) requires rejecting a replayed nonce inside the
+skew window but names no scope. This module fixes the scope.
+
+### The Scope Chosen, and Why
+One nonce namespace **per verifying key**, shared by **every resource** (path, host, port, query),
+remembered until `timestamp + maxSkew`. Not per resource, because:
+1. Only the **path** is signed (`createSignedFetch` signs `new URL(url).pathname`). A captured
+   request still verifies when replayed at `…/verify?attempt=2`, another host, another port or
+   another scheme — a cache keyed by resource URL calls each of those a new resource and accepts
+   every replay. The test shows the signature passing and the global store rejecting for all five.
+2. Two paths legitimately signed with one nonce is a client bug the verifier cannot tell from an
+   attack; #407 says reject.
+3. Per key, not global across keys: key B can never replay key A's request (signature bound to A's
+   secret), so sharing a namespace across tenants costs availability for no security gain.
+4. `timestamp + maxSkew` is the last instant the request could pass the skew check, so eviction
+   after it has no gap and the store cannot grow unboundedly (the #407 helper's plain `Set` never
+   evicts).
+
+### What the Tests Cover
+- One nonce, two legitimately signed requests to `/verify` and `/settle`: second rejected by the
+  global store, both accepted by the naive per-resource cache (kept as the negative control).
+- A request captured from the real `createSignedFetch` replayed under five different resource
+  identifiers with the same signed path: signature verifies each time; global store rejects;
+  per-resource cache accepts.
+- Scope boundaries: same nonce under two keys is fresh for each; a replay does not poison the key's
+  later nonces; two independent stores do not share state (deployment note: multi-process
+  verifiers need a shared backing store).
+- #407 window: remembered at the last verifiable second, evicted one second later; nonce checked
+  after the signature so a forged request neither probes nor burns a nonce; the #407
+  `verifyWithReplayWindow` helper is correct only when the caller shares one `Set` across resources
+  and silently accepts the cross-resource reuse when given a `Set` per resource.
+
+### Manual Run
+```sh
+npx vitest run contrib/x402-nonce-scope
+```
+
+### Integration into Core
+1. **`src/x402-request-auth.ts`**: above the "nonce tracking are the SERVER's job" comment, state
+   the scope: *per verifying key, across all resources, for `toleranceSeconds` past the request
+   timestamp — never per resource, because only the path is signed.*
+2. **`contrib/x402-wave-407-411/request-auth-vectors.ts`**: add `nonceScope: "per-key-all-resources"`
+   to `REQUEST_AUTH_VERIFIER_CONTRACT` and let `verifyWithReplayWindow` take a `NonceStore` instead
+   of a bare `Set`, so the scope is in the published contract and the eviction rule travels with it.
+3. Move the test to `src/x402-request-auth.test.ts` (the nonce is not in x402-guards).
