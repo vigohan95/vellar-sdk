@@ -669,3 +669,57 @@ that have no common unit — the cheaper-looking option wins by accident of magn
 Replace the `reduce` in `selectRequirements` (src/x402-guards.ts:142-144) with
 `selectWithAssetPreference` when candidates span multiple assets, or add an optional
 `preferredAssets` field to `X402PayOptions`.
+---
+
+## 19. Fuzz Test for the Policy Template / Generate Response Parser (#675)
+
+We add [contrib/policy-response-fuzz/policy-response-fuzz.test.ts](policy-response-fuzz/policy-response-fuzz.test.ts)
+with the reference parser in [contrib/policy-response-fuzz/policy-response-parser.ts](policy-response-fuzz/policy-response-parser.ts).
+
+### What the Fuzzer Found
+`src/policy-client.ts` has no parser: `req<T>` returns `(await res.json().catch(() => ({}))) as T`.
+Running 750 seeded adversarial bodies per endpoint (3 seeds × 250, structured mutations of valid
+fixtures plus text-level corruption) against the real `createPolicyClient` shows:
+- **Two raw `TypeError` crashes** (not a named error): any non-2xx whose JSON body is the literal
+  `null` (`payload.message` on null), and a 2xx `null` body on `generate` / `deployInstance` /
+  `recordDeployment` (destructuring `{ policy }` / `{ contractId }` from null).
+- **Every other wrong-but-valid-JSON body resolves** and is handed to the caller with a type it does
+  not have: a string where the template list should be, `status: "deployed2"`,
+  `manifest.network: "futurenet"`, a `policy` that is an array, `__proto__` keys, and so on.
+  The harness counts these ("unchecked") and asserts the count is non-zero today.
+
+Both crash classes are pinned as regression tests next to the harness; the test for the real client
+fails if a crash outside the known classes ever appears.
+
+### What the Parser Does
+- `PolicyParseError` — one named error carrying `endpoint`, dotted `path` (e.g. `manifest.network`)
+  and `reason`, distinct from `PolicyApiError` (gateway said no) by design.
+- Structural parsers per response shape (`parsePolicyTemplateList`, `parseGeneratedPolicy`,
+  `parsePolicyEnvelope`, `parseValidationResult`, `parseSimulateResult`,
+  `parseDeployInstanceResult`, `parseGeneratedPolicyList`) that build fresh objects from known
+  fields — never spread or return the raw payload — so hostile keys cannot reach a caller.
+- Depth (16) and node (50 000) bounds checked iteratively before any field is read: a nesting bomb is
+  a `PolicyParseError`, not a `RangeError`.
+- Enum checks on `status`, `manifest.network`, `enforcement.kind`; digit-string check on stroops;
+  ISO-8601 check on timestamps; status/record consistency (`deployed` ⇒ `deployment` present).
+- `readBody` reads a body without ever throwing and distinguishes JSON (including `null`), empty,
+  and non-JSON.
+- `createParsedPolicyClient` — the same `PolicyClient` surface and byte-identical requests (a parity
+  test pins URL, method and body for all seven methods) with the response side replaced, so a call
+  resolves with a value that has the declared type or rejects with `PolicyApiError` |
+  `PolicyParseError`.
+
+### Manual Run
+```sh
+npx vitest run contrib/policy-response-fuzz
+```
+
+### Integration into Core
+1. **`src/policy-types.ts`**: add `PolicyParseError` next to `PolicyApiError`.
+2. **`src/policy-client.ts`**: replace `(await res.json().catch(() => ({})))` with `readBody` (so a
+   `null` body cannot reach `payload.message`), and run the matching parser on each 2xx body before
+   returning. `createParsedPolicyClient` then collapses into the real client.
+3. **`src/policy-client.test.ts`**: move the regression tests under "regression: bodies that crash"
+   there; they flip from asserting the `TypeError` to asserting the named error.
+4. Optionally move the fuzz harness to `src/policy-client.fuzz.test.ts`, as #442 suggested for
+   the auth-entry fuzzer.
